@@ -1,33 +1,222 @@
+// Package csv reads and writes tab-separated values (TT) files.
+//
+// A tt file contains zero or more records of one or more fields per record.
+// Each record is separated by the newline character. The final record may
+// optionally be followed by a newline character.
+//
+//  field1,field2,field3
+// White space is considered part of a field.
+//
+// Carriage returns before newline characters are silently removed.
+//
+// Blank lines are ignored.  A line with only whitespace characters (excluding
+// the ending newline character) is not considered a blank line.
+//
+// Fields which start and stop with the quote character ` are called
+// quoted-fields.
+// The beginning and ending quote are not part of the field.
+//
+// The source:
+//
+//  normal string,`quoted-field`
+// results in the fields
+//
+//  {"normal string", "quoted-field"}
+// Within a character ^ followed by a second character ^ is considered a single
+// quote.
+//
+//  ^^the "word" is true^^,^foo^a "quoted-field"^foo^
+// results in
+//
+//  {`the "word" is true`, `a "quoted-field"`}
+// Newlines and commas may be included in a quoted-field
+//
+//  ^^`Multi-line
+//  field`^^,`comma
+// is ,`
+// results in
+//
+//  {"`Multi-line\nfield`", "comma\nis ,"}
 package gott
 
 import (
 	"bufio"
 	"bytes"
-	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
-	"time"
 )
 
-const (
-	INT   = "INT"
-	STR   = "STR"
-	FLOAT = "FLOAT"
-	TIME  = "TIME"
-	BLOB  = "BLOB"
-)
-
-type Decoder struct {
-	reader  *bufio.Reader
-	columns []string
-	types   []string
+type ParseError struct {
+	Line   int   // Line where the error occurred
+	Column int   // Column (rune index) where the error occurred
+	Err    error // The actual error
 }
 
-func NewDecoder(r io.Reader) *Decoder {
+var (
+	ErrQuote      = errors.New("extraneous ` in field")
+	ErrUpQuote    = errors.New("extraneous ^ in field")
+	ErrNotUpQuote = errors.New("extraneous ^ not end field")
+	ErrFieldCount = errors.New("wrong number of fields in line")
+)
 
-	return &Decoder{reader: bufio.NewReader(r)}
+func (e *ParseError) Error() string {
+	return fmt.Sprintf("line:%d,column:%d parse error:%s", e.Line, e.Column, e.Err)
+}
+
+// A Reader reads records from a TT-encoded file.
+//
+// As returned by NewReader. The exported fields can be changed to customize
+// the details before the first call to Read or ReadAll.
+//
+// Comma is the field delimiter. It defaults to '\t'.
+//
+// Comment, if not 0, is the comment character. Lines beginning with the Comment
+// character are ignored.
+//
+// If FieldsPerRecord is positive, Read requires each record to have the given
+// number of fields. If FieldsPerRecord is 0, Read sets it to the number of
+// fields in the first record, so that future records must have the same field
+// count. If FieldsPerRecord is negative, no check is made and records may have
+// a variable number of fields.
+type Reader struct {
+	Comma           rune // field delimiter (set to '\t' by NewReader)
+	Comment         rune // comment character for start of line
+	FieldsPerRecord int  // number of expected fields per record
+	r               *bufio.Reader
+}
+
+//NewReader returns a new Reader that reads from r.
+func NewReader(r io.Reader) *Reader {
+	return &Reader{
+		Comma: '\t',
+		r:     bufio.NewReader(r),
+	}
+}
+
+//Read reads one record from r. The record is a slice of strings with each
+// string representing one field.
+func (r *Reader) Read() (record []string, err error) {
+	for {
+		record, err = r.parseRecord()
+		if record != nil {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	if r.FieldsPerRecord > 0 {
+		if len(record) != r.FieldsPerRecord {
+			return record, fmt.Errorf("error field count:%d,must is :%d,data:%#v", len(record), r.FieldsPerRecord, record)
+		}
+	} else if r.FieldsPerRecord == 0 {
+		r.FieldsPerRecord = len(record)
+	}
+	return record, nil
+}
+
+// ReadAll reads all the remaining records from r.
+// Each record is a slice of fields.
+// A successful call returns err == nil, not err == EOF. Because ReadAll is
+// defined to read until EOF, it does not treat end of file as an error to be
+// reported.
+func (r *Reader) ReadAll() (records [][]string, err error) {
+	for {
+		record, err := r.Read()
+		if err == io.EOF {
+			return records, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+}
+
+func (dec *Reader) parseRecord() ([]string, error) {
+	result := []string{}
+	oneField := &bytes.Buffer{}
+	for {
+		if r, _, err := dec.r.ReadRune(); err != nil {
+			if err == io.EOF {
+				//如果首字符是EOF，则返回nil
+
+				if len(result) == 0 && oneField.Len() == 0 {
+					result = nil
+				} else {
+					result = append(result, oneField.String())
+				}
+			}
+			return result, err
+		} else {
+			switch r {
+			case dec.Comment:
+				//如果首字符是注释符号，则返回nil
+				if len(result) == 0 && oneField.Len() == 0 {
+					_, err := dec.r.ReadString('\n')
+					return nil, err
+				}
+			case dec.Comma:
+				result = append(result, oneField.String())
+				oneField.Reset()
+			case '\r':
+				//\r被丢弃
+				if nextC, err := dec.r.Peek(1); err != nil {
+					return nil, err
+				} else if nextC[0] != '\n' {
+					if _, err := oneField.WriteRune(r); err != nil {
+						return nil, err
+					}
+				}
+			case '\n':
+				//如果首字符是\n，则返回nil
+				if len(result) == 0 && oneField.Len() == 0 {
+					result = nil
+				} else {
+
+					result = append(result, oneField.String())
+				}
+				return result, nil
+			case '`':
+				if oneField.Len() != 0 {
+					return result, fmt.Errorf("the line :%v,%s format error,\"`\"at the data", result, oneField)
+				}
+				if str, err := dec.r.ReadString('`'); err != nil {
+					return result, fmt.Errorf("the line :%v,%s format error,\"`\" not end", result, str)
+				} else {
+					//取出最后的`符号
+					result = append(result, str[:len(str)-1])
+				}
+				if r1, _, err := dec.r.ReadRune(); err != nil || r1 != dec.Comma {
+					return result, err
+				}
+			case '^':
+				if oneField.Len() != 0 {
+					return result, fmt.Errorf("the line :%v,%s format error,\"^\"at the data", result, oneField)
+				}
+				if str, err := dec.r.ReadString('^'); err != nil {
+					return result, fmt.Errorf("the line :%v,%s format error,\"^\" not end", result, str)
+				} else {
+					id := "^" + str
+					if oneField, err := read(dec.r, []byte(id)); err != nil {
+						return result, fmt.Errorf("the line :%v,%s format error,%s not end", result, oneField, id)
+					} else {
+						result = append(result, string(oneField))
+					}
+				}
+				if r1, _, err := dec.r.ReadRune(); err != nil || r1 != dec.Comma {
+					return result, err
+				}
+			default:
+				if _, err := oneField.WriteRune(r); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
 }
 
 type reader interface {
@@ -47,180 +236,27 @@ func read(r reader, delim []byte) (line []byte, err error) {
 		}
 	}
 }
-func (dec *Decoder) readLine() ([]string, error) {
-	result := []string{}
-	oneField := &bytes.Buffer{}
-	for {
-		if r, _, err := dec.reader.ReadRune(); err != nil {
-			if err == io.EOF {
-				result = append(result, oneField.String())
-			}
-			return result, err
-		} else {
-			switch r {
-			case '\t':
-				result = append(result, oneField.String())
-				oneField.Reset()
-			case '\r':
-			//\r被丢弃
-			case '\n':
-				result = append(result, oneField.String())
-				return result, nil
-			case '`':
-				if oneField.Len() != 0 {
-					return result, fmt.Errorf("the line :%v,%s format error,\"`\"at the data", result, oneField)
-				}
-				if str, err := dec.reader.ReadString('`'); err != nil {
-					return result, fmt.Errorf("the line :%v,%s format error,\"`\" not end", result, str)
-				} else {
-					//取出最后的`符号
-					result = append(result, str[:len(str)-1])
-				}
-			case '^':
-				if oneField.Len() != 0 {
-					return result, fmt.Errorf("the line :%v,%s format error,\"^\"at the data", result, oneField)
-				}
-				if str, err := dec.reader.ReadString('^'); err != nil {
-					return result, fmt.Errorf("the line :%v,%s format error,\"^\" not end", result, str)
-				} else {
-					id := "^" + str
-					if oneField, err := read(dec.reader, []byte(id)); err != nil {
-						return result, fmt.Errorf("the line :%v,%s format error,%s not end", result, oneField, id)
-					} else {
-						//取出最后的id
-						result = append(result, str[:len(str)-len(id)])
-					}
-				}
-			default:
-				if _, err := oneField.WriteRune(r); err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-}
-func (dec *Decoder) readHeader() (err error) {
-	if dec.columns == nil {
-		dec.columns, err = dec.readLine()
-	}
-	if err != nil {
-		return
-	}
-	if dec.types == nil {
-		dec.types, err = dec.readLine()
-	}
-	return
-}
-func (dec *Decoder) typeStr(record []string) (result []interface{}, err error) {
-	if record == nil || len(record) == 0 {
-		panic("the record is nil")
-	}
-	if len(record) != len(dec.columns) {
-		return nil, fmt.Errorf("record:%v length is %d,column number is %d", record, len(record), len(dec.columns))
-	}
-	result = []interface{}{}
-	for i, v := range record {
-		if v == "" {
-			result = append(result, nil)
-		} else {
-			var tmp interface{}
-			switch dec.types[i] {
-			case INT:
-				tmp, err = strconv.ParseInt(v, 10, 64)
-			case STR:
-				tmp = v
-			case FLOAT:
-				tmp, err = strconv.ParseFloat(v, 64)
-			case TIME:
-				tmp, err = time.Parse(time.RFC3339, v)
-			case BLOB:
-				tmp, err = base64.StdEncoding.DecodeString(v)
-			default:
-				panic(fmt.Errorf("the type %s invalid", dec.types[i]))
-			}
-			if err != nil {
-				return
-			}
-			result = append(result, tmp)
-		}
-	}
-	return
+
+// A Writer writes records to a TT encoded file.
+//
+// As returned by NewWriter, a Writer writes records terminated by a
+// newline and uses '\t' as the field delimiter.  The exported fields can be
+// changed to customize the details before the first call to Write or WriteAll.
+//
+// Comma is the field delimiter.
+type Writer struct {
+	Comma rune
+	w     *bufio.Writer
 }
 
-//从输入流中取出一条记录的值，e必须为指向[]interface{}的指针，
-//自动跳过第一、第二行，空行
-func (dec *Decoder) Decode() ([]interface{}, error) {
-	if dec.columns == nil {
-		if err := dec.readHeader(); err != nil {
-			return nil, err
-		}
-	}
-	if line, err := dec.readLine(); err != nil {
-		if err == io.EOF {
-			tarray, _ := dec.typeStr(line)
-			return tarray, err
-		} else {
-			return nil, err
-		}
-	} else {
-		return dec.typeStr(line)
+// NewWriter returns a new Writer that writes to w.
+func NewWriter(w io.Writer) *Writer {
+	return &Writer{
+		w:     bufio.NewWriter(w),
+		Comma: '\t',
 	}
 }
-
-//读取并返回输入流中第一行的内容，各列的名称
-func (dec *Decoder) Columns() (result []string, err error) {
-	if dec.columns == nil {
-		err = dec.readHeader()
-	}
-	result = dec.columns
-	return
-}
-
-//读取并返回输入流中第二行的内容，各列的数据类型
-func (dec *Decoder) Types() (result []string, err error) {
-	if dec.columns == nil {
-		err = dec.readHeader()
-	}
-	result = dec.types
-	return
-}
-
-type Encoder struct {
-	writer  io.Writer
-	columns []string
-	types   []string
-}
-
-//用指定的字段名、数据类型初始化一个流，调用完成后，第一行、第二行的内容已经写入
-func NewEncoder(w io.Writer, columns []string, types []string) *Encoder {
-	if len(columns) == 0 {
-		panic("must have column")
-	}
-	if len(columns) != len(types) {
-		panic("the column number and type number must equ")
-	}
-	for _, s := range columns {
-		if strings.ContainsAny(s, "\r\n\t") {
-			panic("the column name can't contains \\r \\n \\t")
-		}
-	}
-	for _, i := range types {
-		switch i {
-		case "INT", "STR", "TIME", "BLOB", "FLOAT":
-		default:
-			panic(fmt.Errorf("the type %d invalid", i))
-		}
-	}
-
-	if _, err := w.Write([]byte(strings.Join(columns, "\t") + "\n")); err != nil {
-		panic(err)
-	}
-	if _, err := w.Write([]byte(strings.Join(types, "\t") + "\n")); err != nil {
-		panic(err)
-	}
-	return &Encoder{w, columns, types}
-}
-func encodeString(str string) string {
+func (w *Writer) encodeString(str string) string {
 	notSign := true
 	notSpec := true
 	dolaId := []string{}
@@ -244,7 +280,7 @@ func encodeString(str string) string {
 		switch c {
 		case '`':
 			notSign = false
-		case '\r', '\n', '\t':
+		case '\r', '\n', w.Comma:
 			notSpec = false
 		case '^':
 			//如果捕获ID已经开始，则增加ID
@@ -300,47 +336,46 @@ func encodeString(str string) string {
 	}
 }
 
-//写入一条记录的值，e为[]interface{}的slice，如果数据类型和个数与
-//预设的不一致，将返回错误
-func (enc *Encoder) Encode(data []interface{}) error {
-	if enc.writer == nil {
-		return fmt.Errorf("must call NewEncoder init the class")
-	}
-	if len(data) != len(enc.columns) {
-		return fmt.Errorf("the data length %d not equ column number:%d", len(data), len(enc.columns))
-	}
-	wdata := []string{}
-	for i, v := range data {
-		t := ""
-		fieldValue := ""
-		switch v := v.(type) {
-		case nil:
-		case string:
-			t = STR
-			fieldValue = encodeString(v)
-		case []byte:
-			t = BLOB
-			fieldValue = base64.StdEncoding.EncodeToString(v)
-		case int, int64, int16, byte:
-			t = INT
-			fieldValue = fmt.Sprintf("%d", v)
-		case float32, float64:
-			t = FLOAT
-			fieldValue = fmt.Sprintf("%f", v)
-		case time.Time:
-			fieldValue = v.Format(time.RFC3339)
-		default:
-			return fmt.Errorf("the type %T invalid", v)
-		}
-		if t != "" && t != enc.types[i] {
-			return fmt.Errorf("the column:%s type is %s,the data type is :%T", enc.columns[i], enc.types[i], v)
-		}
-		wdata = append(wdata, fieldValue)
+// Writer writes a single TT record to w along with any necessary quoting.
+// A record is a slice of strings with each string being one field.
+func (w *Writer) Write(record []string) (err error) {
 
+	if w.w == nil {
+		return fmt.Errorf("must call NewWriter init the class")
+	}
+	if record == nil || len(record) == 0 {
+		return fmt.Errorf("the record is nil")
+	}
+	wdata := make([]string, len(record))
+	for i, v := range record {
+		wdata[i] = w.encodeString(v)
 	}
 
-	if _, err := enc.writer.Write([]byte(strings.Join(wdata, "\t") + "\n")); err != nil {
+	if _, err := w.w.Write([]byte(strings.Join(wdata, string(w.Comma)) + "\n")); err != nil {
 		return err
 	}
 	return nil
+}
+
+// Flush writes any buffered data to the underlying io.Writer.
+// To check if an error occurred during the Flush, call Error.
+func (w *Writer) Flush() {
+	w.w.Flush()
+}
+
+// Error reports any error that has occurred during a previous Write or Flush.
+func (w *Writer) Error() error {
+	_, err := w.w.Write(nil)
+	return err
+}
+
+// WriteAll writes multiple TT records to w using Write and then calls Flush.
+func (w *Writer) WriteAll(records [][]string) (err error) {
+	for _, record := range records {
+		err = w.Write(record)
+		if err != nil {
+			return err
+		}
+	}
+	return w.w.Flush()
 }
