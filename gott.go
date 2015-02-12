@@ -46,7 +46,6 @@ import (
 	"fmt"
 	"io"
 	"strconv"
-	"strings"
 )
 
 type ParseError struct {
@@ -100,7 +99,7 @@ func NewReader(r io.Reader) *Reader {
 // string representing one field.
 func (r *Reader) Read() (record []string, err error) {
 	for {
-		record, err = r.parseRecord()
+		record, _, err = r.ReadWithFormat()
 		if record != nil {
 			break
 		}
@@ -136,83 +135,90 @@ func (r *Reader) ReadAll() (records [][]string, err error) {
 	}
 }
 
-func (dec *Reader) parseRecord() ([]string, error) {
+//当是空行,返回nil,当是注释，返回nil,[]string{注释内容}
+func (dec *Reader) ReadWithFormat() ([]string, []string, error) {
 	result := []string{}
+	format := []string{}
 	oneField := &bytes.Buffer{}
 	for {
 		if r, _, err := dec.r.ReadRune(); err != nil {
 			if err == io.EOF {
 				//如果首字符是EOF，则返回nil
-
 				if len(result) == 0 && oneField.Len() == 0 {
 					result = nil
+					format = nil
 				} else {
 					result = append(result, oneField.String())
+					format = append(format, "")
 				}
 			}
-			return result, err
+			return result, format, err
 		} else {
 			switch r {
 			case dec.Comment:
 				//如果首字符是注释符号，则返回nil
 				if len(result) == 0 && oneField.Len() == 0 {
-					_, err := dec.r.ReadString('\n')
-					return nil, err
+					comment, err := dec.r.ReadString('\n')
+					return nil, []string{comment}, err
 				}
 			case dec.Comma:
 				result = append(result, oneField.String())
+				format = append(format, "")
 				oneField.Reset()
 			case '\r':
 				//\r被丢弃
 				if nextC, err := dec.r.Peek(1); err != nil {
-					return nil, err
+					return nil, nil, err
 				} else if nextC[0] != '\n' {
 					if _, err := oneField.WriteRune(r); err != nil {
-						return nil, err
+						return nil, nil, err
 					}
 				}
 			case '\n':
 				//如果首字符是\n，则返回nil
 				if len(result) == 0 && oneField.Len() == 0 {
 					result = nil
+					format = nil
 				} else {
-
 					result = append(result, oneField.String())
+					format = append(format, "")
 				}
-				return result, nil
+				return result, format, nil
 			case '`':
 				if oneField.Len() != 0 {
-					return result, fmt.Errorf("the line :%v,%s format error,\"`\"at the data", result, oneField)
+					return result, format, fmt.Errorf("the line :%v,%s format error,\"`\"at the data", result, oneField)
 				}
 				if str, err := dec.r.ReadString('`'); err != nil {
-					return result, fmt.Errorf("the line :%v,%s format error,\"`\" not end", result, str)
+					return result, format, fmt.Errorf("the line :%v,%s format error,\"`\" not end", result, str)
 				} else {
 					//取出最后的`符号
 					result = append(result, str[:len(str)-1])
+					format = append(format, "`")
 				}
 				if r1, _, err := dec.r.ReadRune(); err != nil || r1 != dec.Comma {
-					return result, err
+					return result, format, err
 				}
 			case '^':
 				if oneField.Len() != 0 {
-					return result, fmt.Errorf("the line :%v,%s format error,\"^\"at the data", result, oneField)
+					return result, format, fmt.Errorf("the line :%v,%s format error,\"^\"at the data", result, oneField)
 				}
 				if str, err := dec.r.ReadString('^'); err != nil {
-					return result, fmt.Errorf("the line :%v,%s format error,\"^\" not end", result, str)
+					return result, format, fmt.Errorf("the line :%v,%s format error,\"^\" not end", result, str)
 				} else {
 					id := "^" + str
 					if oneField, err := read(dec.r, []byte(id)); err != nil {
-						return result, fmt.Errorf("the line :%v,%s format error,%s not end", result, oneField, id)
+						return result, format, fmt.Errorf("the line :%v,%s format error,%s not end", result, oneField, id)
 					} else {
 						result = append(result, string(oneField))
+						format = append(format, id)
 					}
 				}
 				if r1, _, err := dec.r.ReadRune(); err != nil || r1 != dec.Comma {
-					return result, err
+					return result, format, err
 				}
 			default:
 				if _, err := oneField.WriteRune(r); err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 			}
 		}
@@ -256,14 +262,14 @@ func NewWriter(w io.Writer) *Writer {
 		Comma: '\t',
 	}
 }
-func (w *Writer) encodeString(str string) string {
+func (w *Writer) getEncodeFormat(str string) string {
 	notSign := true
 	notSpec := true
 	dolaId := []string{}
 	oneId := bytes.Buffer{}
 	idLen := -1
 	if str == "" {
-		return str
+		return ""
 	}
 	//如果是` ^开头，则取消非特殊化标识，因为解析时会错误识别为多行字符串
 	if str[0] == '^' {
@@ -299,11 +305,11 @@ func (w *Writer) encodeString(str string) string {
 	}
 	//如果没有含有歧义的字符，则是原样输出
 	if notSpec {
-		return str
+		return ""
 	}
 	//如果没有出现上单引号，则返回以其包括的字符串
 	if notSign {
-		return "`" + str + "`"
+		return "`"
 	}
 	//确定一个分割字符串
 	dem := ""
@@ -332,8 +338,51 @@ func (w *Writer) encodeString(str string) string {
 	if has {
 		panic("can't gen the ^??^ id")
 	} else {
-		return "^" + dem + "^" + str + "^" + dem + "^"
+		return "^" + dem + "^"
 	}
+}
+func (w *Writer) WriteWithFormat(record []string, format []string) (err error) {
+	for i, v := range record {
+		if format[i] == "" {
+			if _, err = w.w.WriteString(v); err != nil {
+				return
+
+			}
+		} else if format[i] == "`" {
+			if _, err = w.w.WriteString(format[i]); err != nil {
+				return
+			}
+			if _, err = w.w.WriteString(v); err != nil {
+				return
+			}
+			if _, err = w.w.WriteString(format[i]); err != nil {
+				return
+			}
+		} else if format[i][0] == '^' {
+			if _, err = w.w.WriteString(format[i]); err != nil {
+				return
+			}
+			if _, err = w.w.WriteString(v); err != nil {
+				return
+			}
+			if _, err = w.w.WriteString(format[i]); err != nil {
+				return
+			}
+		} else {
+			return fmt.Errorf("invalid format :%s", format[i])
+		}
+		//last field
+		if i < len(record)-1 {
+			if _, err = w.w.WriteRune(w.Comma); err != nil {
+				return
+			}
+
+		}
+	}
+	if _, err = w.w.WriteRune('\n'); err != nil {
+		return err
+	}
+	return
 }
 
 // Writer writes a single TT record to w along with any necessary quoting.
@@ -346,21 +395,17 @@ func (w *Writer) Write(record []string) (err error) {
 	if record == nil || len(record) == 0 {
 		return fmt.Errorf("the record is nil")
 	}
-	wdata := make([]string, len(record))
+	format := make([]string, len(record))
 	for i, v := range record {
-		wdata[i] = w.encodeString(v)
+		format[i] = w.getEncodeFormat(v)
 	}
-
-	if _, err := w.w.Write([]byte(strings.Join(wdata, string(w.Comma)) + "\n")); err != nil {
-		return err
-	}
-	return nil
+	return w.WriteWithFormat(record, format)
 }
 
 // Flush writes any buffered data to the underlying io.Writer.
 // To check if an error occurred during the Flush, call Error.
-func (w *Writer) Flush() {
-	w.w.Flush()
+func (w *Writer) Flush() error {
+	return w.w.Flush()
 }
 
 // Error reports any error that has occurred during a previous Write or Flush.
@@ -377,5 +422,5 @@ func (w *Writer) WriteAll(records [][]string) (err error) {
 			return err
 		}
 	}
-	return w.w.Flush()
+	return w.Flush()
 }
